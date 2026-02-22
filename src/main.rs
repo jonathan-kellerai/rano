@@ -6939,34 +6939,35 @@ fn output_report_json(
     out.push_str("  },\n");
 
     // Session info (if available and filtering by run_id)
-    if has_sessions
-        && let Some(ref run_id) = filter.run_id
-        && let Some(session) = query_session(conn, run_id)?
-    {
-        out.push_str("  \"session\": {\n");
-        out.push_str(&format!("    \"run_id\": \"{}\",\n", session.run_id));
-        out.push_str(&format!("    \"start_ts\": \"{}\",\n", session.start_ts));
-        if let Some(end) = &session.end_ts {
-            out.push_str(&format!("    \"end_ts\": \"{}\",\n", end));
+    if has_sessions {
+        if let Some(ref run_id) = filter.run_id {
+            if let Some(session) = query_session(conn, run_id)? {
+                out.push_str("  \"session\": {\n");
+                out.push_str(&format!("    \"run_id\": \"{}\",\n", session.run_id));
+                out.push_str(&format!("    \"start_ts\": \"{}\",\n", session.start_ts));
+                if let Some(end) = &session.end_ts {
+                    out.push_str(&format!("    \"end_ts\": \"{}\",\n", end));
+                }
+                if let Some(host) = &session.host {
+                    out.push_str(&format!("    \"host\": \"{}\",\n", host));
+                }
+                if let Some(user) = &session.user {
+                    out.push_str(&format!("    \"user\": \"{}\",\n", user));
+                }
+                if let Some(patterns) = &session.patterns {
+                    out.push_str(&format!("    \"patterns\": \"{}\",\n", patterns));
+                }
+                out.push_str(&format!(
+                    "    \"connects\": {},\n",
+                    session.connects.unwrap_or(0)
+                ));
+                out.push_str(&format!(
+                    "    \"closes\": {}\n",
+                    session.closes.unwrap_or(0)
+                ));
+                out.push_str("  },\n");
+            }
         }
-        if let Some(host) = &session.host {
-            out.push_str(&format!("    \"host\": \"{}\",\n", host));
-        }
-        if let Some(user) = &session.user {
-            out.push_str(&format!("    \"user\": \"{}\",\n", user));
-        }
-        if let Some(patterns) = &session.patterns {
-            out.push_str(&format!("    \"patterns\": \"{}\",\n", patterns));
-        }
-        out.push_str(&format!(
-            "    \"connects\": {},\n",
-            session.connects.unwrap_or(0)
-        ));
-        out.push_str(&format!(
-            "    \"closes\": {}\n",
-            session.closes.unwrap_or(0)
-        ));
-        out.push_str("  },\n");
     }
 
     // Summary statistics
@@ -7090,35 +7091,36 @@ fn output_report_pretty(
     }
 
     // Session info
-    if has_sessions
-        && let Some(ref run_id) = filter.run_id
-        && let Some(session) = query_session(conn, run_id)?
-    {
-        println!(
-            "\n{}",
-            if color {
-                "\x1b[1;36mSession\x1b[0m"
-            } else {
-                "Session"
+    if has_sessions {
+        if let Some(ref run_id) = filter.run_id {
+            if let Some(session) = query_session(conn, run_id)? {
+                println!(
+                    "\n{}",
+                    if color {
+                        "\x1b[1;36mSession\x1b[0m"
+                    } else {
+                        "Session"
+                    }
+                );
+                println!("  Run ID:   {}", session.run_id);
+                println!("  Started:  {}", session.start_ts);
+                if let Some(end) = &session.end_ts {
+                    println!("  Ended:    {}", end);
+                    // Calculate and display duration
+                    if let Some(duration) = format_session_duration(&session.start_ts, end) {
+                        println!("  Duration: {}", duration);
+                    }
+                }
+                if let Some(host) = &session.host {
+                    println!("  Host:     {}", host);
+                }
+                if let Some(user) = &session.user {
+                    println!("  User:     {}", user);
+                }
+                if let Some(patterns) = &session.patterns {
+                    println!("  Patterns: {}", patterns);
+                }
             }
-        );
-        println!("  Run ID:   {}", session.run_id);
-        println!("  Started:  {}", session.start_ts);
-        if let Some(end) = &session.end_ts {
-            println!("  Ended:    {}", end);
-            // Calculate and display duration
-            if let Some(duration) = format_session_duration(&session.start_ts, end) {
-                println!("  Duration: {}", duration);
-            }
-        }
-        if let Some(host) = &session.host {
-            println!("  Host:     {}", host);
-        }
-        if let Some(user) = &session.user {
-            println!("  User:     {}", user);
-        }
-        if let Some(patterns) = &session.patterns {
-            println!("  Patterns: {}", patterns);
         }
     }
 

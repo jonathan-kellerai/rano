@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -863,7 +863,6 @@ struct NetEntry {
     local_port: u16,
     remote_ip: IpAddr,
     remote_port: u16,
-    inode: u64,
     state: String,
 }
 
@@ -1523,25 +1522,23 @@ fn main() {
         } else {
             collect_descendants(&roots)
         };
-        let inode_to_pid = map_inodes(&targets);
         let pid_meta = build_pid_meta_map(&targets, &provider_matcher);
 
         let mut seen_keys: HashSet<ConnKey> = HashSet::new();
-        let entries = gather_net_entries(args.include_udp);
+        let entries = gather_connections(args.include_udp);
         let now = SystemTime::now();
 
-        for (proto, entry) in entries {
+        for (proto, entry, pid) in entries {
             if entry.remote_port == 0 {
                 continue;
             }
-            if !args.include_listening && entry.state == "0A" && proto == Proto::Tcp {
+            if !args.include_listening
+                && entry.state.eq_ignore_ascii_case("listen")
+                && proto == Proto::Tcp
+            {
                 continue;
             }
 
-            let pid = match inode_to_pid.get(&entry.inode) {
-                Some(pid) => *pid,
-                None => continue,
-            };
             if !targets.contains(&pid) {
                 continue;
             }
@@ -5382,24 +5379,6 @@ fn collect_descendants(roots: &[u32]) -> HashSet<u32> {
     set
 }
 
-fn map_inodes(targets: &HashSet<u32>) -> HashMap<u64, u32> {
-    let mut map = HashMap::new();
-    for pid in targets {
-        let fd_dir = format!("/proc/{}/fd", pid);
-        if let Ok(entries) = fs::read_dir(fd_dir) {
-            for entry in entries.flatten() {
-                if let Ok(link) = fs::read_link(entry.path()) {
-                    let link_str = link.to_string_lossy();
-                    if let Some(inode) = parse_socket_inode(&link_str) {
-                        map.insert(inode, *pid);
-                    }
-                }
-            }
-        }
-    }
-    map
-}
-
 fn build_pid_meta_map(targets: &HashSet<u32>, matcher: &ProviderMatcher) -> HashMap<u32, PidMeta> {
     let mut map = HashMap::new();
     for pid in targets {
@@ -5431,159 +5410,240 @@ fn provider_from_text(comm: &str, cmdline: &str, matcher: &ProviderMatcher) -> P
     }
 }
 
-fn parse_socket_inode(link: &str) -> Option<u64> {
-    if let Some(start) = link.find("socket:[") {
-        let rest = &link[start + 8..];
-        if let Some(end) = rest.find(']') {
-            let inode_str = &rest[..end];
-            return inode_str.parse::<u64>().ok();
-        }
-    }
-    None
+// macOS proc_info FFI — proc_bsdinfo gives us pid, ppid, and comm without needing kinfo_proc.
+// MAXCOMLEN = 16 per <sys/param.h>; pbi_name is 2*MAXCOMLEN = 32.
+#[repr(C)]
+struct ProcBsdInfo {
+    pbi_flags:   u32,
+    pbi_status:  u32,
+    pbi_xstatus: u32,
+    pbi_pid:     u32,
+    pbi_ppid:    u32,
+    pbi_uid:     u32,
+    pbi_gid:     u32,
+    pbi_ruid:    u32,
+    pbi_rgid:    u32,
+    pbi_svuid:   u32,
+    pbi_svgid:   u32,
+    rfu_1:       u32,
+    pbi_comm:    [libc::c_char; 16],    // MAXCOMLEN
+    pbi_name:    [libc::c_char; 32],    // 2 * MAXCOMLEN
+    pbi_nfiles:  u32,
+    pbi_pgid:    u32,
+    pbi_pjobc:   u32,
+    e_tdev:      u32,
+    e_tpgid:     u32,
+    pbi_nice:    i32,
+    pbi_start_tvsec:  u64,
+    pbi_start_tvusec: u64,
 }
 
+unsafe extern "C" {
+    fn proc_listallpids(buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
+    fn proc_pidinfo(pid: libc::c_int, flavor: libc::c_int, arg: u64,
+                    buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
+}
+
+const PROC_PIDTBSDINFO: libc::c_int = 3;
+
 fn list_pids() -> Vec<u32> {
-    let mut pids = Vec::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(pid) = name.parse::<u32>() {
-                    pids.push(pid);
-                }
-            }
+    unsafe {
+        // First call: get required buffer size (returns count of pids)
+        let count = proc_listallpids(std::ptr::null_mut(), 0);
+        if count <= 0 {
+            return Vec::new();
         }
+        let capacity = (count as usize) + 16; // add slack for race
+        let mut buf: Vec<i32> = vec![0i32; capacity];
+        let ret = proc_listallpids(
+            buf.as_mut_ptr() as *mut libc::c_void,
+            (capacity * std::mem::size_of::<i32>()) as libc::c_int,
+        );
+        if ret <= 0 {
+            return Vec::new();
+        }
+        buf.iter().take(ret as usize).filter(|&&p| p > 0).map(|&p| p as u32).collect()
     }
-    pids
+}
+
+fn query_proc_info(pid: u32) -> Option<ProcBsdInfo> {
+    unsafe {
+        let mut info: ProcBsdInfo = std::mem::zeroed();
+        let ret = proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<ProcBsdInfo>() as libc::c_int,
+        );
+        if ret <= 0 {
+            return None;
+        }
+        Some(info)
+    }
 }
 
 fn read_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/comm", pid);
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    let info = query_proc_info(pid)?;
+    // Prefer the longer pbi_name if set, fall back to pbi_comm.
+    let name_ptr = info.pbi_name.as_ptr();
+    let comm_ptr = info.pbi_comm.as_ptr();
+    let s = unsafe {
+        if *name_ptr != 0 {
+            CStr::from_ptr(name_ptr)
+        } else {
+            CStr::from_ptr(comm_ptr)
+        }
+    };
+    Some(s.to_string_lossy().into_owned())
 }
 
 fn read_cmdline(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/cmdline", pid);
-    let mut data = Vec::new();
-    if let Ok(mut file) = fs::File::open(path) {
-        if file.read_to_end(&mut data).is_ok() {
-            let cmd = data
-                .split(|b| *b == 0)
-                .filter(|s| !s.is_empty())
+    unsafe {
+        let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let mut size: libc::size_t = 0;
+        if libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) != 0 || size < 4 {
+            return None;
+        }
+        let mut buf: Vec<u8> = vec![0u8; size];
+        if libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut libc::c_void, &mut size, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+        buf.truncate(size);
+        if buf.len() < 4 {
+            return None;
+        }
+        // KERN_PROCARGS2 format: [4-byte argc][exec_path NUL][padding NUL*][argv[0] NUL][argv[1] NUL]...
+        let argc = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let rest = &buf[4..];
+        let args: Vec<&[u8]> = rest
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .take(argc + 1)
+            .collect();
+        if args.is_empty() {
+            return None;
+        }
+        Some(
+            args.iter()
                 .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect::<Vec<_>>()
-                .join(" ");
-            return Some(cmd);
-        }
+                .join(" "),
+        )
     }
-    None
 }
 
 fn read_ppid(pid: u32) -> Option<u32> {
-    let path = format!("/proc/{}/stat", pid);
-    let content = fs::read_to_string(path).ok()?;
-    let parts: Vec<&str> = content.split_whitespace().collect();
-    if parts.len() > 3 {
-        parts[3].parse::<u32>().ok()
-    } else {
-        None
-    }
+    let info = query_proc_info(pid)?;
+    Some(info.pbi_ppid)
 }
 
-fn gather_net_entries(include_udp: bool) -> Vec<(Proto, NetEntry)> {
-    let mut entries = Vec::new();
-    entries.extend(read_net_file("/proc/net/tcp", Proto::Tcp, false));
-    entries.extend(read_net_file("/proc/net/tcp6", Proto::Tcp, true));
+fn gather_connections(include_udp: bool) -> Vec<(Proto, NetEntry, u32)> {
+    let mut cmd = ProcessCommand::new("lsof");
     if include_udp {
-        entries.extend(read_net_file("/proc/net/udp", Proto::Udp, false));
-        entries.extend(read_net_file("/proc/net/udp6", Proto::Udp, true));
-    }
-    entries
-}
-
-fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Vec<(Proto, NetEntry)> {
-    let mut result = Vec::new();
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return result,
-    };
-    let reader = BufReader::new(file);
-
-    for (idx, line_result) in reader.lines().enumerate() {
-        if idx == 0 {
-            continue;
-        }
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 10 {
-            continue;
-        }
-        let local = parts[1];
-        let remote = parts[2];
-        let state = parts[3].to_string();
-        let inode = parts[9].parse::<u64>().unwrap_or(0);
-
-        let (local_ip, local_port) = match parse_addr_port(local, ipv6) {
-            Some(v) => v,
-            None => continue,
-        };
-        let (remote_ip, remote_port) = match parse_addr_port(remote, ipv6) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        result.push((
-            proto,
-            NetEntry {
-                local_ip,
-                local_port,
-                remote_ip,
-                remote_port,
-                inode,
-                state,
-            },
-        ));
-    }
-    result
-}
-
-fn parse_addr_port(s: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
-    let mut iter = s.split(':');
-    let addr_hex = iter.next()?;
-    let port_hex = iter.next()?;
-    let port = u16::from_str_radix(port_hex, 16).ok()?;
-    let ip = if ipv6 {
-        IpAddr::V6(parse_ipv6(addr_hex)?)
+        cmd.args(["-n", "-P", "-i", "-F", "pfPn"]);
     } else {
-        IpAddr::V4(parse_ipv4(addr_hex)?)
+        cmd.args(["-n", "-P", "-i", "TCP", "-F", "pfPn"]);
+    }
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_lsof_output(&text)
+}
+
+fn parse_lsof_output(text: &str) -> Vec<(Proto, NetEntry, u32)> {
+    let mut results = Vec::new();
+    let mut cur_pid: u32 = 0;
+    let mut cur_proto: Option<Proto> = None;
+
+    for line in text.lines() {
+        if line.len() < 2 {
+            continue;
+        }
+        let (key, val) = line.split_at(1);
+        match key {
+            "p" => {
+                cur_pid = val.parse().unwrap_or(0);
+                cur_proto = None;
+            }
+            "f" => {
+                cur_proto = None;
+            }
+            "P" => {
+                cur_proto = match val {
+                    "TCP" => Some(Proto::Tcp),
+                    "UDP" => Some(Proto::Udp),
+                    _ => None,
+                };
+            }
+            "n" => {
+                if cur_pid == 0 {
+                    continue;
+                }
+                let proto = match cur_proto {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if let Some(entry) = parse_lsof_name(val) {
+                    results.push((proto, entry, cur_pid));
+                }
+            }
+            _ => {}
+        }
+    }
+    results
+}
+
+fn parse_lsof_name(name: &str) -> Option<NetEntry> {
+    // Extract state from trailing "(STATE)"
+    let (conn_part, state) = if let Some(pos) = name.rfind(" (") {
+        let state = name[pos + 2..].trim_end_matches(')').to_string();
+        (&name[..pos], state)
+    } else {
+        (name, String::new())
+    };
+
+    // Split on "->" to separate local from remote
+    let (local_str, remote_str) = if let Some(arrow) = conn_part.find("->") {
+        (&conn_part[..arrow], &conn_part[arrow + 2..])
+    } else {
+        (conn_part, "0.0.0.0:0")
+    };
+
+    let (local_ip, local_port) = parse_lsof_addr(local_str)?;
+    let (remote_ip, remote_port) = parse_lsof_addr(remote_str)?;
+
+    Some(NetEntry {
+        local_ip,
+        local_port,
+        remote_ip,
+        remote_port,
+        state,
+    })
+}
+
+fn parse_lsof_addr(s: &str) -> Option<(IpAddr, u16)> {
+    // IPv6 with brackets: [::1]:port or [addr]:port
+    if s.starts_with('[') {
+        if let Some(bracket_end) = s.find("]:") {
+            let ip: Ipv6Addr = s[1..bracket_end].parse().ok()?;
+            let port: u16 = s[bracket_end + 2..].parse().ok()?;
+            return Some((IpAddr::V6(ip), port));
+        }
+        return None;
+    }
+    // Wildcard or IPv4: *:port or 1.2.3.4:port
+    let colon = s.rfind(':')?;
+    let ip_str = &s[..colon];
+    let port: u16 = s[colon + 1..].parse().ok()?;
+    let ip = if ip_str == "*" {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        ip_str.parse().ok()?
     };
     Some((ip, port))
-}
-
-fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
-    if hex.len() != 8 {
-        return None;
-    }
-    let raw = u32::from_str_radix(hex, 16).ok()?;
-    let bytes = raw.to_le_bytes();
-    Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
-}
-
-fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut bytes = [0u8; 16];
-    for i in 0..4 {
-        let part = &hex[i * 8..(i + 1) * 8];
-        let raw = u32::from_str_radix(part, 16).ok()?;
-        let chunk = raw.to_le_bytes();
-        bytes[i * 4..i * 4 + 4].copy_from_slice(&chunk);
-    }
-    Some(Ipv6Addr::from(bytes))
 }
 
 // ============================================================================

@@ -1,0 +1,92 @@
+# Personal Lefthook Configuration
+#
+# Lightweight hooks for personal repos. No Jira keys, no branch naming,
+# no specialized linters. Just the essentials.
+#
+# To use: copy to repo root as lefthook.yml, then run `lefthook install`
+# For KellerAI repos: use the full config from ~/.claude/configs/lefthook.yml
+
+output:
+  - summary
+  - failure
+
+pre-commit:
+  parallel: true
+  jobs:
+    # Block .DS_Store files
+    - name: block-ds-store
+      run: |
+        ds_files=$(git diff --cached --name-only --diff-filter=d | rg '(^|/)\.DS_Store$' || true)
+        if [ -n "$ds_files" ]; then
+          echo "Blocked .DS_Store files:"
+          echo "$ds_files"
+          echo "Fix: git restore --staged \$ds_files"
+          exit 1
+        fi
+
+    # Secret detection
+    - name: gitleaks
+      run: gitleaks protect --staged --log-opts="--diff-filter=d --staged"
+
+    # JS/TS formatting (auto-fix, uses repo biome.json or defaults)
+    - name: biome
+      glob: "*.{js,jsx,ts,tsx,json}"
+      run: npx biome check --write {staged_files}
+      stage_fixed: true
+
+    # Python linting (auto-fix, uses repo pyproject.toml or defaults)
+    - name: ruff-lint
+      glob: "*.py"
+      run: ruff check --fix {staged_files}
+      stage_fixed: true
+
+    - name: ruff-format
+      glob: "*.py"
+      run: ruff format {staged_files}
+      stage_fixed: true
+
+pre-push:
+  jobs:
+    - name: block-upstream-push
+      run: |
+        # Guard: no remote should have Dicklesworthstone/rano as its push URL
+        bad=$(git remote -v | rg '\(push\)' | rg 'Dicklesworthstone/rano' | awk '{print $1}')
+        if [ -n "$bad" ]; then
+          echo "ERROR: Remote '$bad' is configured to push to Dicklesworthstone/rano (read-only upstream)."
+          echo "Fix: git remote set-url --push $bad no_push"
+          exit 1
+        fi
+
+commit-msg:
+  jobs:
+    - name: conventional-commit
+      run: |
+        msg=$(head -1 {1})
+        # Allow MINOR: prefix for trivial changes
+        if echo "$msg" | rg -q '^MINOR:'; then
+          exit 0
+        fi
+        # Require conventional commit format: type(scope): description
+        if ! echo "$msg" | rg -q '^(build|chore|ci|docs|feat|fix|perf|refactor|test)(\([^)]+\))?: .+'; then
+          echo "Commit message must match: <type>(<scope>): <description>"
+          echo "Types: build|chore|ci|docs|feat|fix|perf|refactor|test"
+          echo "Or use: MINOR: <description> for trivial changes"
+          exit 1
+        fi
+
+    - name: require-body
+      run: |
+        msg=$(cat {1})
+        header=$(echo "$msg" | head -1)
+        # Skip body check for MINOR: commits
+        if echo "$header" | rg -q '^MINOR:'; then
+          exit 0
+        fi
+        # Check for body (line 3+, after blank line)
+        body=$(echo "$msg" | tail -n +3 | rg -v '^\s*$' | head -1)
+        if [ -z "$body" ]; then
+          echo "Commit body required. Explain WHY this change matters."
+          echo "Add a blank line after the header, then the body."
+          echo "Exception: use MINOR: prefix for trivial changes."
+          exit 1
+        fi

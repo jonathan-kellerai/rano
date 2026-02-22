@@ -1179,8 +1179,33 @@ struct SqliteEvent {
     retry_count: Option<usize>,
 }
 
+struct ProcessEvent {
+    ts: String,
+    run_id: String,
+    event: String,
+    pid: u32,
+    ppid: u32,
+    comm: String,
+    uid: u32,
+    gid: u32,
+    start_ts: Option<String>,
+    exit_status: Option<u32>,
+    flags: u32,
+    nfiles: u32,
+    vsize_bytes: Option<u64>,
+    rss_bytes: Option<u64>,
+    user_time_ns: Option<u64>,
+    sys_time_ns: Option<u64>,
+    thread_count: Option<i32>,
+    context_switches: Option<i32>,
+    page_faults: Option<i32>,
+    unix_syscalls: Option<i32>,
+    mach_syscalls: Option<i32>,
+}
+
 enum SqliteMsg {
     Event(SqliteEvent),
+    ProcessEvent(ProcessEvent),
     Shutdown {
         run_id: String,
         connects: u64,
@@ -1204,6 +1229,18 @@ struct SqliteWriter {
 impl SqliteWriter {
     fn enqueue(&self, event: SqliteEvent) {
         match self.sender.try_send(SqliteMsg::Event(event)) {
+            Ok(_) => {}
+            Err(TrySendError::Full(_)) => {
+                self.record_drop(1);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.record_drop(1);
+            }
+        }
+    }
+
+    fn enqueue_process(&self, event: ProcessEvent) {
+        match self.sender.try_send(SqliteMsg::ProcessEvent(event)) {
             Ok(_) => {}
             Err(TrySendError::Full(_)) => {
                 self.record_drop(1);
@@ -1506,6 +1543,7 @@ fn main() {
     let mut last_stats = SystemTime::now();
     let mut last_cycle = SystemTime::now();
     let mut stats_view_index: usize = 0;
+    let mut prev_targets: HashSet<u32> = HashSet::new();
 
     loop {
         if !RUNNING.load(Ordering::SeqCst) {
@@ -1522,6 +1560,83 @@ fn main() {
         } else {
             collect_descendants(&roots)
         };
+
+        // Process lifecycle: detect spawn/exit events each poll cycle
+        if let Some(writer) = sqlite_writer.as_ref() {
+            let proc_ts = now_rfc3339();
+            for pid in targets.iter() {
+                if !prev_targets.contains(pid) {
+                    // New process (spawn)
+                    if let Some(bsd) = query_proc_info(*pid) {
+                        let task = query_task_info(*pid);
+                        let comm = unsafe {
+                            let name_ptr = bsd.pbi_name.as_ptr();
+                            let comm_ptr = bsd.pbi_comm.as_ptr();
+                            let s = if *name_ptr != 0 {
+                                std::ffi::CStr::from_ptr(name_ptr)
+                            } else {
+                                std::ffi::CStr::from_ptr(comm_ptr)
+                            };
+                            s.to_string_lossy().into_owned()
+                        };
+                        let start_ts = Some(format!("{}", bsd.pbi_start_tvsec));
+                        writer.enqueue_process(ProcessEvent {
+                            ts: proc_ts.clone(),
+                            run_id: run_ctx.run_id.clone(),
+                            event: "spawn".to_string(),
+                            pid: *pid,
+                            ppid: bsd.pbi_ppid,
+                            comm,
+                            uid: bsd.pbi_uid,
+                            gid: bsd.pbi_gid,
+                            start_ts,
+                            exit_status: None,
+                            flags: bsd.pbi_flags,
+                            nfiles: bsd.pbi_nfiles,
+                            vsize_bytes: task.as_ref().map(|t| t.pti_virtual_size),
+                            rss_bytes: task.as_ref().map(|t| t.pti_resident_size),
+                            user_time_ns: task.as_ref().map(|t| t.pti_total_user),
+                            sys_time_ns: task.as_ref().map(|t| t.pti_total_system),
+                            thread_count: task.as_ref().map(|t| t.pti_threadnum),
+                            context_switches: task.as_ref().map(|t| t.pti_csw),
+                            page_faults: task.as_ref().map(|t| t.pti_faults),
+                            unix_syscalls: task.as_ref().map(|t| t.pti_syscalls_unix),
+                            mach_syscalls: task.as_ref().map(|t| t.pti_syscalls_mach),
+                        });
+                    }
+                }
+            }
+            for pid in prev_targets.iter() {
+                if !targets.contains(pid) {
+                    // Process exited
+                    writer.enqueue_process(ProcessEvent {
+                        ts: proc_ts.clone(),
+                        run_id: run_ctx.run_id.clone(),
+                        event: "exit".to_string(),
+                        pid: *pid,
+                        ppid: 0,
+                        comm: String::new(),
+                        uid: 0,
+                        gid: 0,
+                        start_ts: None,
+                        exit_status: None,
+                        flags: 0,
+                        nfiles: 0,
+                        vsize_bytes: None,
+                        rss_bytes: None,
+                        user_time_ns: None,
+                        sys_time_ns: None,
+                        thread_count: None,
+                        context_switches: None,
+                        page_faults: None,
+                        unix_syscalls: None,
+                        mach_syscalls: None,
+                    });
+                }
+            }
+        }
+        prev_targets = targets.clone();
+
         let pid_meta = build_pid_meta_map(&targets, &provider_matcher);
 
         let mut seen_keys: HashSet<ConnKey> = HashSet::new();
@@ -4860,6 +4975,15 @@ fn sqlite_writer_loop(
             Ok(SqliteMsg::Event(event)) => {
                 batch.push(event);
             }
+            Ok(SqliteMsg::ProcessEvent(pe)) => {
+                if let Err(err) = log_sqlite_process_event(&mut conn, &pe) {
+                    let msg = format!("warning: sqlite process event write failed: {}", err);
+                    eprintln!("{}", msg);
+                    if let Some(writer) = log_writer.as_ref() {
+                        writer.write_line(&msg);
+                    }
+                }
+            }
             Ok(SqliteMsg::Shutdown {
                 run_id,
                 connects,
@@ -4894,6 +5018,15 @@ fn sqlite_writer_loop(
     while let Ok(msg) = receiver.try_recv() {
         match msg {
             SqliteMsg::Event(event) => batch.push(event),
+            SqliteMsg::ProcessEvent(pe) => {
+                if let Err(err) = log_sqlite_process_event(&mut conn, &pe) {
+                    let msg = format!("warning: sqlite process event write failed: {}", err);
+                    eprintln!("{}", msg);
+                    if let Some(writer) = log_writer.as_ref() {
+                        writer.write_line(&msg);
+                    }
+                }
+            }
             SqliteMsg::Shutdown {
                 run_id,
                 connects,
@@ -5445,6 +5578,46 @@ unsafe extern "C" {
 }
 
 const PROC_PIDTBSDINFO: libc::c_int = 3;
+const PROC_PIDTASKINFO: libc::c_int = 4;
+
+#[repr(C)]
+struct ProcTaskInfo {
+    pti_virtual_size:      u64,
+    pti_resident_size:     u64,
+    pti_total_user:        u64,
+    pti_total_system:      u64,
+    pti_threads_user:      u64,
+    pti_threads_system:    u64,
+    pti_policy:            i32,
+    pti_faults:            i32,
+    pti_pageins:           i32,
+    pti_cow_faults:        i32,
+    pti_messages_sent:     i32,
+    pti_messages_received: i32,
+    pti_syscalls_mach:     i32,
+    pti_syscalls_unix:     i32,
+    pti_csw:               i32,
+    pti_threadnum:         i32,
+    pti_numrunning:        i32,
+    pti_priority:          i32,
+}
+
+fn query_task_info(pid: u32) -> Option<ProcTaskInfo> {
+    unsafe {
+        let mut info: ProcTaskInfo = std::mem::zeroed();
+        let ret = proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<ProcTaskInfo>() as libc::c_int,
+        );
+        if ret <= 0 {
+            return None;
+        }
+        Some(info)
+    }
+}
 
 fn list_pids() -> Vec<u32> {
     unsafe {
@@ -7885,6 +8058,41 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
             closes INTEGER,
             session_name TEXT
         );
+        CREATE TABLE IF NOT EXISTS processes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            run_id TEXT,
+            event TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            ppid INTEGER,
+            comm TEXT,
+            uid INTEGER,
+            gid INTEGER,
+            start_ts TEXT,
+            exit_status INTEGER,
+            flags INTEGER,
+            nfiles INTEGER,
+            vsize_bytes INTEGER,
+            rss_bytes INTEGER,
+            user_time_ns INTEGER,
+            sys_time_ns INTEGER,
+            thread_count INTEGER,
+            context_switches INTEGER,
+            page_faults INTEGER,
+            unix_syscalls INTEGER,
+            mach_syscalls INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(ts);
+        CREATE INDEX IF NOT EXISTS idx_processes_pid ON processes(pid);
+        CREATE INDEX IF NOT EXISTS idx_processes_run_id ON processes(run_id);
+        CREATE VIEW IF NOT EXISTS process_network_summary AS
+            SELECT p.pid, p.comm, p.run_id,
+                   COUNT(e.id) AS network_events,
+                   GROUP_CONCAT(DISTINCT e.domain) AS domains
+            FROM processes p
+            LEFT JOIN events e ON e.pid = p.pid AND e.run_id = p.run_id
+            WHERE p.event = 'spawn'
+            GROUP BY p.pid, p.comm, p.run_id;
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
         CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);
@@ -8024,6 +8232,37 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             event.duration_ms.map(|v| v as i64),
             if event.alert { 1 } else { 0 },
             event.retry_count.map(|v| v as i64),
+        ],
+    )?;
+    Ok(())
+}
+
+fn log_sqlite_process_event(conn: &mut Connection, event: &ProcessEvent) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO processes (ts, run_id, event, pid, ppid, comm, uid, gid, start_ts, exit_status, flags, nfiles, vsize_bytes, rss_bytes, user_time_ns, sys_time_ns, thread_count, context_switches, page_faults, unix_syscalls, mach_syscalls)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            &event.ts,
+            &event.run_id,
+            &event.event,
+            event.pid as i64,
+            event.ppid as i64,
+            &event.comm,
+            event.uid as i64,
+            event.gid as i64,
+            event.start_ts.as_deref(),
+            event.exit_status.map(|v| v as i64),
+            event.flags as i64,
+            event.nfiles as i64,
+            event.vsize_bytes.map(|v| v as i64),
+            event.rss_bytes.map(|v| v as i64),
+            event.user_time_ns.map(|v| v as i64),
+            event.sys_time_ns.map(|v| v as i64),
+            event.thread_count.map(|v| v as i64),
+            event.context_switches.map(|v| v as i64),
+            event.page_faults.map(|v| v as i64),
+            event.unix_syscalls.map(|v| v as i64),
+            event.mach_syscalls.map(|v| v as i64),
         ],
     )?;
     Ok(())
